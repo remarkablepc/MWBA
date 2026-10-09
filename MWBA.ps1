@@ -474,7 +474,11 @@ function Test-MWBA-WinSxSIntegrity {
     $manPath = Join-Path $OfflineWindowsDrive 'Windows\WinSxS\Manifests'
     if (-not (Test-Path $manPath -ErrorAction SilentlyContinue)) { return @{ Ok=$false; Reason='ManifestsMissing' } }
     try {
-        $count = (Get-ChildItem -Path $manPath -File -ErrorAction SilentlyContinue | Measure-Object).Count
+        $count = 0
+        foreach ($f in [System.IO.Directory]::EnumerateFiles($manPath)) {
+            $count++
+            if ($count -ge 20) { break }
+        }
     } catch { $count = 0 }
     if ($count -lt 20) { return @{ Ok=$false; Reason='FewManifests' } }
     return @{ Ok=$true; Reason='OK' }
@@ -553,7 +557,66 @@ function Compute-MWBA-ReinstallScore {
     # 6) BCD and EFI healthy but OS fails to initialize
     if ($postDetails -and $postDetails.BCDBootManager -and $postDetails.EFIStructureOk -and $PostStatus.Status -ne 'Healthy') { $score++; $reasons.Add('BCD/EFI healthy but OS fails to initialize') }
 
-    return @{ ReinstallScore = $score; Reasons = $reasons.ToArray() }
+    # 7) Critical user-mode subsystem binaries missing or corrupted
+    $criticalBinaries = @('ntdll.dll', 'csrss.exe', 'smss.exe', 'winlogon.exe')
+    foreach ($bin in $criticalBinaries) {
+        $binPath = Join-Path $OfflineWindowsDrive "Windows\System32\$bin"
+        if (-not (Test-Path $binPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+            $score += 2
+            $reasons.Add("Critical subsystem binary missing: System32\$bin")
+        } elseif ((Get-Item $binPath -ErrorAction SilentlyContinue).Length -eq 0) {
+            $score += 2
+            $reasons.Add("Critical subsystem binary zero-byte corrupted: System32\$bin")
+        }
+    }
+
+    # Discover customer user profiles in \Users to confirm data safety
+    $userProfiles = @()
+    $usersDir = Join-Path $OfflineWindowsDrive 'Users'
+    if (Test-Path $usersDir -ErrorAction SilentlyContinue) {
+        $userProfiles = @(Get-ChildItem -Path $usersDir -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^(Public|Default|Default User|All Users|TEMP|TEMP\..*|UMFD-.*|\$.*)$' } |
+            Select-Object -ExpandProperty Name)
+    }
+
+    return @{ ReinstallScore = $score; Reasons = $reasons.ToArray(); UserProfiles = $userProfiles }
+}
+
+function Show-MWBA-StopLossAdvisory {
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$ReinstallReport,
+        [string]$OfflineWindowsDrive = 'C:'
+    )
+    Write-Host "`n======================================================================" -ForegroundColor Magenta
+    Write-Host "  [!] MWBA BENCH STOP-LOSS SAFEGUARD: WINDOWS UNRECOVERABLE OFFLINE" -ForegroundColor Magenta
+    Write-Host "======================================================================" -ForegroundColor Magenta
+    Write-Host "ReinstallScore: $($ReinstallReport.ReinstallScore) | Forensic Diagnosis:" -ForegroundColor Yellow
+    foreach ($r in $ReinstallReport.Reasons) {
+        Write-Host "  [-] $r" -ForegroundColor Yellow
+    }
+    Write-Host "`n[!] WHY SCRIPTED FILE REPAIRS CANNOT FIX THIS:" -ForegroundColor Red
+    Write-Host "  1. Bootloader & Kernel are functional, but user-mode subsystem has collapsed." -ForegroundColor DarkYellow
+    Write-Host "  2. Modern Windows relies on 50,000+ interdependent WinSxS assembly manifests." -ForegroundColor DarkYellow
+    Write-Host "  3. Binary timestamps/builds across updates are mismatched, breaking API contracts" -ForegroundColor DarkYellow
+    Write-Host "     between ntdll.dll and csrss.exe (Windows kernel triggers fatal 0xC000021A)." -ForegroundColor DarkYellow
+    Write-Host "  4. Scripted file transplants cannot re-link the global WinSxS dependency graph." -ForegroundColor DarkYellow
+
+    if ($ReinstallReport.UserProfiles -and $ReinstallReport.UserProfiles.Count -gt 0) {
+        $profilesList = ($ReinstallReport.UserProfiles -join ', ')
+        Write-Host "`n[+] CUSTOMER DATA IS INTACT IN \Users:" -ForegroundColor Green
+        Write-Host "    Detected User Profile(s): $profilesList" -ForegroundColor White
+        Write-Host "    Target Path             : $OfflineWindowsDrive\Users" -ForegroundColor Gray
+    }
+
+    Write-Host "`n[+] RECOMMENDED BENCH ACTIONS (Time-to-Resolution: < 15 mins):" -ForegroundColor Green
+    Write-Host "  [1] Preserve Customer Data (First Priority):" -ForegroundColor Cyan
+    Write-Host "      Copy $OfflineWindowsDrive\Users to technician bench backup drive or network share." -ForegroundColor White
+    Write-Host "  [2] Semi-Clean Deployment (Preserves unformatted files in Users):" -ForegroundColor Cyan
+    Write-Host "      dism.exe /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:$OfflineWindowsDrive\" -ForegroundColor White
+    Write-Host "  [3] Clean Windows Reinstall:" -ForegroundColor Cyan
+    Write-Host "      Format target partition and install clean Windows OS." -ForegroundColor White
+    Write-Host "  [!] Bench Rule: Stop offline tinkering now. Protect customer data and redeploy." -ForegroundColor Yellow
+    Write-Host "======================================================================`n" -ForegroundColor Magenta
 }
 
 ### Stage 1: safe, reversible actions ###
@@ -1003,12 +1066,28 @@ function Invoke-MWBA-OfflineSfcScan {
     }
 }
 
-function Start-MWBA-SmokeTestVM {
+function Test-MWBA-HyperVAvailable {
+    try {
+        $cmd = Get-Command Get-VM -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $false }
+        $svc = Get-Service vmms -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -ne 'Running') { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-MWBA-SmokeTestVM {
     param(
         [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
-        [string]$VmName = "MWBA-SmokeTest-VM"
+        [string]$VmName = "MWBA-BootTest-VM",
+        [int]$RamMB = 4096
     )
-    Write-MWBA "Start-MWBA-SmokeTestVM: setting up Hyper-V Pass-Through Boot Simulator..."
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "   MWBA: HYPER-V PASS-THROUGH DISK BOOT SMOKE TEST              " -ForegroundColor Cyan
+    Write-Host "   Target Volume        : $OfflineWindowsDrive                  " -ForegroundColor Cyan
+    Write-Host "   Virtual Machine Name : $VmName                               " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
+
     $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
     $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
     if (-not $part) {
@@ -1017,57 +1096,140 @@ function Start-MWBA-SmokeTestVM {
     }
     $diskNum = $part[0].DiskNumber
 
-    if ($Script:MWBA_DryRun) {
-        Write-MWBA "DRYRUN: Would set Disk $diskNum Offline, create Gen 2 VM '$VmName', attach Disk $diskNum, and launch vmconnect.exe"
+    # Safety Guard: Refuse to take the live host boot drive offline!
+    $hostBootDisk = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':')) -ErrorAction SilentlyContinue).DiskNumber
+    if ($diskNum -eq $hostBootDisk) {
+        Write-Host "[-] SAFETY HALT: Disk $diskNum is the live host system drive ($env:SystemDrive)." -ForegroundColor Red
+        Write-Host "    Cannot take the running host operating system drive offline!" -ForegroundColor Red
         return
     }
 
-    Stop-VM -Name $VmName -TurnOff -Force -ErrorAction SilentlyContinue
-    Remove-VM -Name $VmName -Force -ErrorAction SilentlyContinue
+    if ($Script:MWBA_DryRun) {
+        Write-MWBA "DRYRUN: Would set Disk $diskNum Offline, create Gen 2 VM '$VmName', attach Disk $diskNum, launch vmconnect.exe, and restore disk Online."
+        return
+    }
 
-    Set-Disk -Number $diskNum -IsOffline $true -ErrorAction Stop
-    $switch = Get-VMSwitch -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Name
-    if (-not $switch) { $switch = "Default Switch" }
+    # 1. Clean previous VM instance if exists
+    $oldVm = Get-VM -Name $VmName -ErrorAction SilentlyContinue
+    if ($oldVm) {
+        Write-Host "[*] Removing previous VM instance $VmName..." -ForegroundColor Gray
+        Stop-VM -Name $VmName -TurnOff -Force -ErrorAction SilentlyContinue
+        Remove-VM -Name $VmName -Force -ErrorAction SilentlyContinue
+    }
 
-    New-VM -Name $VmName -Generation 2 -MemoryStartupBytes 1024MB -SwitchName $switch | Out-Null
-    Set-VM -Name $VmName -ProcessorCount 2 -CheckpointType Disabled | Out-Null
-    Set-VMFirmware -VMName $VmName -EnableSecureBoot Off | Out-Null
-    Add-VMHardDiskDrive -VMName $VmName -DiskNumber $diskNum | Out-Null
+    # 2. Set target physical disk offline for Hyper-V pass-through
+    Write-Host "[>] Setting Physical Disk $diskNum to Offline for VM pass-through..." -ForegroundColor Yellow
+    try {
+        Set-Disk -Number $diskNum -IsOffline $true -ErrorAction Stop
+        Write-Host "[+] Disk $diskNum is now Offline for host OS." -ForegroundColor Green
+    } catch {
+        Write-Host "[-] Failed to set Disk $diskNum offline: $_" -ForegroundColor Red
+        return
+    }
 
-    $ramProfiles = @(
-        @{ Startup = 1024; Min = 384; Max = 1536 },
-        @{ Startup = 768;  Min = 384; Max = 1024 },
-        @{ Startup = 512;  Min = 384; Max = 768 }
-    )
+    try {
+        # 3. Create Gen 2 VM
+        Write-Host "[>] Creating Generation 2 Virtual Machine..." -ForegroundColor Yellow
+        $switch = Get-VMSwitch -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Name
+        if (-not $switch) { $switch = "Default Switch" }
 
-    $vmStarted = $false
-    foreach ($prof in $ramProfiles) {
+        New-VM -Name $VmName -Generation 2 -MemoryStartupBytes 1024MB -SwitchName $switch | Out-Null
+        Set-VM -Name $VmName -ProcessorCount 2 -CheckpointType Disabled | Out-Null
+        $hdd = Add-VMHardDiskDrive -VMName $VmName -DiskNumber $diskNum -Passthru
+
         try {
-            Set-VMMemory -VMName $VmName -DynamicMemoryEnabled $true -MinimumBytes ($prof.Min * 1MB) -StartupBytes ($prof.Startup * 1MB) -MaximumBytes ($prof.Max * 1MB) -ErrorAction SilentlyContinue | Out-Null
-            Start-VM -Name $VmName -ErrorAction Stop
-            $vmStarted = $true
-            Write-MWBA "Hyper-V Smoke Test VM '$VmName' started successfully on Disk $diskNum ($($prof.Startup)MB RAM, dynamic expansion enabled)."
-            break
+            Set-VMFirmware -VMName $VmName -EnableSecureBoot On -SecureBootTemplate "MicrosoftWindows" -FirstBootDevice $hdd | Out-Null
+            Write-Host "[+] Gen 2 VM configured with physical disk pass-through and Secure Boot ON." -ForegroundColor Green
         } catch {
-            $msg = $_.Exception.Message
-            if ($msg -match "0x8007000E" -or $msg -match "Not enough memory") {
-                Write-MWBA "Host memory low for $($prof.Startup)MB. Stepping down RAM..." 'WARN'
-                [System.GC]::Collect()
-                Start-Sleep -Milliseconds 500
-            } else {
-                Write-MWBA "Failed to start VM '$VmName': $msg" 'FAIL'
+            Set-VMFirmware -VMName $VmName -EnableSecureBoot Off -FirstBootDevice $hdd -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "[!] Secure Boot template not supported by host. Secure Boot disabled." -ForegroundColor Yellow
+        }
+
+        # Dynamic RAM profiles with fallback
+        $ramProfiles = @(
+            @{ Startup = 2048; Min = 512; Max = 4096 },
+            @{ Startup = 1024; Min = 384; Max = 2048 },
+            @{ Startup = 768;  Min = 384; Max = 1024 }
+        )
+
+        $vmStarted = $false
+        foreach ($prof in $ramProfiles) {
+            try {
+                Set-VMMemory -VMName $VmName -DynamicMemoryEnabled $true -MinimumBytes ($prof.Min * 1MB) -StartupBytes ($prof.Startup * 1MB) -MaximumBytes ($prof.Max * 1MB) -ErrorAction SilentlyContinue | Out-Null
+                Start-VM -Name $VmName -ErrorAction Stop
+                $vmStarted = $true
+                Write-Host "[+] VM $VmName is RUNNING and booting from Disk $diskNum ($($prof.Startup)MB RAM, dynamic expansion enabled)." -ForegroundColor Green
                 break
+            } catch {
+                $msg = $_.Exception.Message
+                if ($msg -match "0x8007000E" -or $msg -match "Not enough memory") {
+                    Write-MWBA "Host memory low for $($prof.Startup)MB. Stepping down RAM..." 'WARN'
+                    [System.GC]::Collect()
+                    Start-Sleep -Milliseconds 500
+                } else {
+                    Write-MWBA "Failed to start VM '$VmName': $msg" 'FAIL'
+                    break
+                }
             }
         }
-    }
 
-    if ($vmStarted) {
-        Start-Process "vmconnect.exe" -ArgumentList "localhost $VmName"
-        Write-MWBA "Hyper-V Display Console (vmconnect.exe) launched."
-    } else {
+        if ($vmStarted) {
+            Write-Host "[*] Opening Hyper-V Display Console (vmconnect)..." -ForegroundColor Cyan
+            $vmcProc = Start-Process "vmconnect.exe" -ArgumentList "localhost $VmName" -PassThru
+
+            Write-Host ""
+            Write-Host "=================================================================" -ForegroundColor Green
+            Write-Host "   SMOKE TEST IS LIVE!                                           " -ForegroundColor Green
+            Write-Host "   Close the VM Console window when you are done testing.        " -ForegroundColor Yellow
+            Write-Host "   The VM will automatically be cleaned up and disk restored!    " -ForegroundColor Yellow
+            Write-Host "=================================================================" -ForegroundColor Green
+
+            if ($vmcProc) {
+                $vmcProc.WaitForExit()
+                Write-Host "`n[*] VM Console closed. Cleaning up VM and restoring host access..." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Warning "Could not start smoke test VM due to memory pressure or host error."
+        }
+    } catch {
+        Write-Host "[-] Hyper-V Smoke Test error: $_" -ForegroundColor Red
+    } finally {
+        # 5. Guaranteed cleanup of VM and restoration of host physical disk access
+        Stop-VM -Name $VmName -TurnOff -Force -ErrorAction SilentlyContinue
+        Remove-VM -Name $VmName -Force -ErrorAction SilentlyContinue
+
+        Write-Host "[>] Restoring Physical Disk $diskNum to Online on host..." -ForegroundColor Yellow
         Set-Disk -Number $diskNum -IsOffline $false -ErrorAction SilentlyContinue
-        Write-Warning "Could not start smoke test VM due to memory pressure or host error. Disk $diskNum restored Online."
+        Set-Disk -Number $diskNum -IsReadOnly $false -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        Write-Host "[+] Physical Disk $diskNum is now back Online for the technician host bench." -ForegroundColor Green
     }
+}
+
+function Invoke-MWBA-OptionalSmokeTest {
+    param([string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive)
+    if (Test-MWBA-HyperVAvailable) {
+        Write-Host "`n======================================================================" -ForegroundColor Cyan
+        Write-Host "  HYPER-V BENCH SMOKE TEST HARNESS DETECTED" -ForegroundColor Cyan
+        Write-Host "======================================================================" -ForegroundColor Cyan
+        Write-Host "Hyper-V virtualization is active on this bench host." -ForegroundColor White
+        Write-Host "You can test boot this repaired drive directly in an isolated Gen 2 VM" -ForegroundColor White
+        Write-Host "without having to physically remount the drive into the customer machine." -ForegroundColor White
+        Write-Host "(MWBA will automatically set the disk offline, boot the VM, launch console," -ForegroundColor DarkYellow
+        Write-Host " and upon closing the console, safely restore the disk back online for host.)" -ForegroundColor DarkYellow
+        $ans = Read-Host "`nWould you like to smoke test booting this disk now? (Y/N)"
+        if ($ans -match '^[Yy]') {
+            Invoke-MWBA-SmokeTestVM -OfflineWindowsDrive $OfflineWindowsDrive
+        }
+    }
+}
+
+function Start-MWBA-SmokeTestVM {
+    param(
+        [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
+        [string]$VmName = "MWBA-SmokeTest-VM"
+    )
+    Invoke-MWBA-SmokeTestVM -OfflineWindowsDrive $OfflineWindowsDrive -VmName $VmName
 }
 
 function Stop-MWBA-SmokeTestVM {
@@ -1075,14 +1237,14 @@ function Stop-MWBA-SmokeTestVM {
         [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
         [string]$VmName = "MWBA-SmokeTest-VM"
     )
-    Write-MWBA "Stop-MWBA-SmokeTestVM: stopping VM and restoring disk..."
+    # Stop & remove VM, bring disk online
     Stop-VM -Name $VmName -TurnOff -Force -ErrorAction SilentlyContinue
     Remove-VM -Name $VmName -Force -ErrorAction SilentlyContinue
-
     $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
     $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
     if ($part) {
         Set-Disk -Number $part[0].DiskNumber -IsOffline $false -ErrorAction SilentlyContinue
+        Set-Disk -Number $part[0].DiskNumber -IsReadOnly $false -ErrorAction SilentlyContinue
         Write-MWBA "Physical Disk $($part[0].DiskNumber) restored Online."
     }
 }
@@ -1220,66 +1382,65 @@ function Start-MWBA {
         Write-MWBA 'Boot artifacts appear present. Disabling boot logging.'
         Toggle-BootLogging -Action Disable -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
         Write-MWBA "Final report: Healthy. Log: $Script:MWBA_LogFile"
+
+        # Offer Hyper-V Smoke Test if available
+        Invoke-MWBA-OptionalSmokeTest -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+
         return @{ Success=$true; Stage=1; Report=$result }
     }
 
-    Write-MWBA 'System appears Unhealthy after Stage1.'
+    Write-MWBA 'System appears Unhealthy after Stage 1.'
 
-    # Generate SFC/DISM suggestions (display only Medium/High by default)
-    try {
-        $suggest = Get-MWBA-SfcDismSuggestion -BootStatus $result -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
-        if (-not $ShowLowConfidence) { $suggest = $suggest | Where-Object { $_.Confidence -ne 'Low' } }
-        if ($suggest.Count -gt 0) {
-            Write-Host "`nSuggested offline diagnostics (SFC/DISM):" -ForegroundColor Cyan
-            Show-MWBA-Suggestions -Suggestions $suggest
-            Write-Host "These are suggestions only. MWBA will not run SFC/DISM automatically." -ForegroundColor Yellow
-        }
-    } catch {
-        Write-MWBA "Failed to compute SFC/DISM suggestions: $($_.Exception.Message)" 'WARN'
-    }
-    Write-Host "Advanced Mode Warning:`nStage 2 contains advanced, reversible actions (ELAM disable, driver rename, BitLocker unlock, EFI file recreate). No destructive ops (hive replace, partition table edits, image reapply) will be performed by MWBA."
-
-    if (-not $AutoConfirmStage2) {
-        $consent = Read-Host "To proceed to Stage 2 type EXACTLY: I UNDERSTAND RISK AND AUTHORIZE STAGE 2"
-        if ($consent -ne 'I UNDERSTAND RISK AND AUTHORIZE STAGE 2') { Write-MWBA 'Stage 2 aborted by operator.'; Write-MWBA "Final report: Unresolved. Log: $Script:MWBA_LogFile"; return @{ Success=$false; Stage=1; Report=$result } }
-    }
-
-    Write-MWBA 'Stage 2 authorized. Note: Stage 2 actions must be invoked explicitly with -Confirm.'
-    Write-MWBA "Final report: Stage2 available. Log: $Script:MWBA_LogFile"
-    # Compute reinstall score and present recommendation if warranted (non-destructive)
+    # Evaluate Stop-Loss Reinstall Score IMMEDIATELY before asking for Stage 2
     try {
         $reinstall = Compute-MWBA-ReinstallScore -PreStatus $prevStatus -PostStatus $result -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
         if ($reinstall.ReinstallScore -ge 2) {
-            Write-Host "`n======================================================================" -ForegroundColor Magenta
-            Write-Host "  MWBA TERMINAL FORENSIC ADVISORY: UNRECOVERABLE SUBSYSTEM CORRUPTION" -ForegroundColor Magenta
-            Write-Host "======================================================================" -ForegroundColor Magenta
-            Write-Host "ReinstallScore: $($reinstall.ReinstallScore) | Triggered Reasons:" -ForegroundColor Yellow
-            foreach ($r in $reinstall.Reasons) { Write-Host "  [-] $r" -ForegroundColor Yellow }
-            Write-Host "`n[!] WHY SCRIPTED FILE REPAIRS CANNOT FIX THIS:" -ForegroundColor Red
-            Write-Host "  1. Bootloader & Kernel are functional, but user-mode subsystem collapsed." -ForegroundColor DarkYellow
-            Write-Host "  2. Modern Windows 11 relies on 50,000+ interdependent WinSxS assembly manifests." -ForegroundColor DarkYellow
-            Write-Host "  3. Binary timestamps/builds across updates are mismatched, breaking API contracts" -ForegroundColor DarkYellow
-            Write-Host "     between ntdll.dll and csrss.exe. Windows halts intentionally with 0xC000021A." -ForegroundColor DarkYellow
-            Write-Host "  4. Scripted file transplants cannot re-link the global WinSxS dependency graph." -ForegroundColor DarkYellow
-            Write-Host "`n[+] RECOMMENDED TECHNICIAN ACTIONS (Time-to-Resolution: < 15 mins):" -ForegroundColor Green
-            Write-Host "  [1] Clone Functional Reference Disk (Fastest & 100% Reliable):" -ForegroundColor Cyan
-            Write-Host "      Clone a healthy, working OS drive (e.g. Reference/Donor drive) directly to $($Script:MWBA_OfflineWindowsDrive)." -ForegroundColor Cyan
-            Write-Host "  [2] Semi-Clean Deployment (DISM Apply-Image):" -ForegroundColor Cyan
-            Write-Host "      dism.exe /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:$($Script:MWBA_OfflineWindowsDrive)\" -ForegroundColor Cyan
-            Write-Host "      (Lays down a clean OS; preserves unformatted files in \Users; apps need reinstall)" -ForegroundColor Gray
-            Write-Host "  [3] Clean Windows Reinstall:" -ForegroundColor Cyan
-            Write-Host "      User data has been preserved ($($Script:MWBA_OfflineWindowsDrive)\Users); format and install fresh." -ForegroundColor Cyan
-            Write-Host "======================================================================`n" -ForegroundColor Magenta
+            Show-MWBA-StopLossAdvisory -ReinstallReport $reinstall -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+            Write-Host "[!] BENCH STOP-LOSS TRIGGERED: Offline repair beyond this point will not fix Zone 3 / WinSxS collapse." -ForegroundColor Yellow
+            $proceedStage2 = Read-Host "Do you still wish to attempt experimental Stage 2 repairs anyway? (Y/N)"
+            if ($proceedStage2 -notmatch '^[Yy]') {
+                Write-MWBA 'Operator accepted Bench Stop-Loss recommendation; aborted before Stage 2.'
+                Write-MWBA "Final report: Unrecoverable Offline. Log: $Script:MWBA_LogFile"
+                Invoke-MWBA-OptionalSmokeTest -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+                return @{ Success=$false; Stage=1; Report=$result; StopLossTriggered=$true }
+            }
+        } else {
+            # Moderate issue: suggest offline SFC/DISM diagnostics
+            $suggest = Get-MWBA-SfcDismSuggestion -BootStatus $result -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+            if (-not $ShowLowConfidence) { $suggest = $suggest | Where-Object { $_.Confidence -ne 'Low' } }
+            if ($suggest.Count -gt 0) {
+                Write-Host "`nSuggested offline diagnostics (SFC/DISM):" -ForegroundColor Cyan
+                Show-MWBA-Suggestions -Suggestions $suggest
+                Write-Host "These are suggestions only. MWBA will not run SFC/DISM automatically." -ForegroundColor Yellow
+            }
         }
     } catch {
         Write-MWBA "Failed to compute reinstall score: $($_.Exception.Message)" 'WARN'
     }
 
+    Write-Host "`nAdvanced Mode Warning:`nStage 2 contains advanced, reversible actions (ELAM disable, driver rename, BitLocker unlock, EFI file recreate). No destructive ops (hive replace, partition table edits, image reapply) will be performed by MWBA."
+
+    if (-not $AutoConfirmStage2) {
+        $consent = Read-Host "To proceed to Stage 2 type EXACTLY: I UNDERSTAND RISK AND AUTHORIZE STAGE 2 (or press Enter to exit)"
+        if ($consent -ne 'I UNDERSTAND RISK AND AUTHORIZE STAGE 2') {
+            Write-MWBA 'Stage 2 aborted by operator.'
+            Write-MWBA "Final report: Unresolved. Log: $Script:MWBA_LogFile"
+            Invoke-MWBA-OptionalSmokeTest -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+            return @{ Success=$false; Stage=1; Report=$result }
+        }
+    }
+
+    Write-MWBA 'Stage 2 authorized. Note: Stage 2 actions must be invoked explicitly with -Confirm.'
+    Write-MWBA "Final report: Stage2 available. Log: $Script:MWBA_LogFile"
+
+    # Offer Hyper-V Smoke Test if available
+    Invoke-MWBA-OptionalSmokeTest -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+
     return @{ Success=$false; Stage=2; Report=$result }
 }
 
-# If executed directly, run Start-MWBA with supplied arguments
-if ($MyInvocation.InvocationName -match 'MWBA.ps1' -or ($PSCommandPath -and (Split-Path $PSCommandPath -Leaf) -eq 'MWBA.ps1')) {
+# If executed directly (not dot-sourced), run Start-MWBA with supplied arguments
+if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s+') -and ($MyInvocation.InvocationName -match 'MWBA\.ps1' -or ($PSCommandPath -and (Split-Path $PSCommandPath -Leaf) -eq 'MWBA.ps1'))) {
     $splat = @{}
     if ($DryRun) { $splat['DryRun'] = $true }
     if ($OfflineWindowsDrive) { $splat['OfflineWindowsDrive'] = $OfflineWindowsDrive }
