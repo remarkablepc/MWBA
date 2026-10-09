@@ -1,0 +1,40 @@
+# MWBA .gitignore - keep sensitive and build artifacts out of the repo
+
+# PowerShell / Editor
+*.ps1xml
+.vscode/
+*.user
+*.suo
+
+# Logs, runs & temp
+*.log
+*.tmp
+*.temp
+*.cache
+tmp/
+*.local
+logs/
+002egit*
+
+# Secrets & Keys (Do NOT commit BitLocker recovery keys)
+*BitLocker*
+*.pfx
+*.key
+*.pem
+*.asc
+*.secret
+
+# Build outputs & runtimes
+*.exe
+*.dll
+*.msi
+*.zip
+*.7z
+bin/
+obj/
+dotnet-runtime/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini

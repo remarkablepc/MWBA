@@ -1,0 +1,9 @@
+# Use Git LFS for large/binary files (enable LFS before committing binaries)
+*.exe filter=lfs diff=lfs merge=lfs -text
+*.msi filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+
+# Ensure text files have consistent line endings on checkout
+*.ps1 text eol=crlf
+*.md text eol=lf
+*.txt text eol=lf
