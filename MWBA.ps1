@@ -21,10 +21,17 @@ $Script:MWBA_OfflineWindowsDrive = $null
 $Script:MWBA_OfflineWindowsPath = $null
 
 function Show-MWBA-Header {
-    $hdr = "MWBA - Make Windows Boot Again (Technician Edition) v$($Script:MWBA_Version)"
-    Write-Host $hdr -ForegroundColor Cyan
-    Write-Host "Mode: $([bool](-not $Script:MWBA_DryRun) -replace 'True','Live' -replace 'False','DryRun')" -ForegroundColor Yellow
-    Write-Host "Log: $Script:MWBA_LogFile`n" -ForegroundColor DarkYellow
+    Write-Host ''
+    Write-Host '  __  __ ____      ______    _    ' -ForegroundColor Cyan
+    Write-Host ' |  \/  \ \    / /  _ \  / \   ' -ForegroundColor Cyan
+    Write-Host ' | |\/| |\ \  / /| |_) |/ _ \  ' -ForegroundColor Cyan
+    Write-Host ' | |  | | \ \/ / |  _ </ ___ \ ' -ForegroundColor Cyan
+    Write-Host ' |_|  |_|  \__/  |_| \_\_/   \_\' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "  MWBA - Make Windows Boot Again (Technician Edition) v$($Script:MWBA_Version)" -ForegroundColor White
+    Write-Host '  Surgical offline BCD recovery, boot driver repair & Hyper-V smoke testing' -ForegroundColor DarkGray
+    Write-Host "  Mode: $([bool](-not $Script:MWBA_DryRun) -replace 'True','Live' -replace 'False','DryRun')" -ForegroundColor Yellow
+    Write-Host "  Log : $Script:MWBA_LogFile`n" -ForegroundColor DarkYellow
 }
 
 function Enable-MWBAPrivileges {
