@@ -1,12 +1,23 @@
-# MWBA .gitignore - keep sensitive and build artifacts out of the repo
+# MWBA .gitignore - keep sensitive, bench, and private artifacts out of the repo
 
-# PowerShell / Editor
+# Private & Maintainer Scripts
+push-to-github.ps1
+*push*.ps1
+*deploy*.ps1
+*publish*.ps1
+*private*.ps1
+*.secret.ps1
+
+# PowerShell & Editor / IDE
 *.ps1xml
 .vscode/
+.vs/
+.idea/
 *.user
 *.suo
+*.code-workspace
 
-# Logs, runs & temp
+# Logs, Runs, Dumps & Temp
 *.log
 *.tmp
 *.temp
@@ -14,15 +25,35 @@
 tmp/
 *.local
 logs/
-002egit*
+*.dmp
+*.DMP
+ntbtlog.txt
+minidump/
+dumps/
 
-# Secrets & Keys (Do NOT commit BitLocker recovery keys)
+# Forensics, Registry Exports & Backups
+*.bak
+*.hiv
+*.reg
+
+# VM, Disks & Media (bench testing)
+*.vhd
+*.vhdx
+*.vmdk
+*.vdi
+*.iso
+*.qcow2
+
+# Secrets & Keys (Do NOT commit BitLocker recovery keys or credentials)
 *BitLocker*
-*.pfx
+*recovery*.txt
 *.key
+*.pfx
 *.pem
 *.asc
 *.secret
+*.token
+*.creds
 
 # Build outputs & runtimes
 *.exe
@@ -34,7 +65,13 @@ bin/
 obj/
 dotnet-runtime/
 
-# OS artifacts
+# Cloud Sync & OS artifacts
 .DS_Store
 Thumbs.db
 desktop.ini
+.dropbox*
+*.dropbox.attr
+.insync*
+*.sync
+*conflicted copy*
+*.conflict

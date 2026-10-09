@@ -142,7 +142,7 @@ MWBA is an engineering scalpel and an objective bench triage platform, not magic
 MWBA deliberately avoids compiling scripts into `.exe` wrappers:
 * **100% Transparent**: Every line of PowerShell is open, readable, and auditable before touching a customer's drive.
 * **Zero AV False Positives**: Third-party wrapper executables (e.g. `ps2exe`) frequently trigger false-positive malware alarms in Windows Defender and enterprise EDR.
-* **Single Entry Point**: [`MWBA.bat`](file:///c:/Users/jdavi/Insync/jdavidhewitt@gmail.com/Dropbox/Scripts/Tools/MWBA/MWBA.bat) provides full UAC auto-elevation and launches [`MWBA.ps1`](file:///c:/Users/jdavi/Insync/jdavidhewitt@gmail.com/Dropbox/Scripts/Tools/MWBA/MWBA.ps1) with a single double-click.
+* **Single Entry Point**: `MWBA.bat` provides full UAC auto-elevation and launches `MWBA.ps1` with a single double-click.
 
 ---
 
