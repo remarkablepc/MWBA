@@ -22,14 +22,15 @@ $Script:MWBA_OfflineWindowsPath = $null
 
 function Show-MWBA-Header {
     Write-Host ''
-    Write-Host '  __  __ ____      ______    _    ' -ForegroundColor Cyan
-    Write-Host ' |  \/  \ \    / /  _ \  / \   ' -ForegroundColor Cyan
-    Write-Host ' | |\/| |\ \  / /| |_) |/ _ \  ' -ForegroundColor Cyan
-    Write-Host ' | |  | | \ \/ / |  _ </ ___ \ ' -ForegroundColor Cyan
-    Write-Host ' |_|  |_|  \__/  |_| \_\_/   \_\' -ForegroundColor Cyan
+    Write-Host '  __  __ _        ______    _    ' -ForegroundColor Cyan
+    Write-Host ' |  \/  \ \      / / __ )  / \   ' -ForegroundColor Cyan
+    Write-Host ' | |\/| |\ \ /\ / /|  _ \ / _ \  ' -ForegroundColor Cyan
+    Write-Host ' | |  | | \ V  V / | |_) / ___ \ ' -ForegroundColor Cyan
+    Write-Host ' |_|  |_|  \_/\_/  |____/_/   \_\' -ForegroundColor Cyan
     Write-Host ''
     Write-Host "  MWBA - Make Windows Boot Again (Technician Edition) v$($Script:MWBA_Version)" -ForegroundColor White
     Write-Host '  Surgical offline BCD recovery, boot driver repair & Hyper-V smoke testing' -ForegroundColor DarkGray
+    Write-Host '  Explore more technician tools: https://github.com/remarkablepc' -ForegroundColor DarkCyan
     Write-Host "  Mode: $([bool](-not $Script:MWBA_DryRun) -replace 'True','Live' -replace 'False','DryRun')" -ForegroundColor Yellow
     Write-Host "  Log : $Script:MWBA_LogFile`n" -ForegroundColor DarkYellow
 }
