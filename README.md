@@ -14,6 +14,8 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Public%20Beta-brightgreen.svg)]()
 [![Tools](https://img.shields.io/badge/Explore%20Tools-RemarkablePC-0078D4?logo=github&logoColor=white)](https://github.com/remarkablepc)
+[![Say Thanks](https://img.shields.io/badge/Say%20Thanks-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/EKH76RTYHH24S?uhm=MWBA)
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/remarkablepc?uhm=MWBA)
 
 **MWBA (Make Windows Bootable Again)** is an automated, technician-grade offline Windows boot repair, forensic verification, and triage platform. It unites offline registry auditing, EFI/BCD reconstruction, filter driver sanitization, cryptographic catalog store repair, donor system transplants, and Hyper-V pass-through VM smoke testing into a single resilient, bipartisan recovery workflow.
 
@@ -209,7 +211,19 @@ Scholars, bench technicians, and bipartisan IT committees have long debated how 
 
 ---
 
+## ❤️ Community Support & Sponsorship
+
+MWBA is **100% free and open source**.
+
+If this toolkit helped recover an unbootable system, rescued an emergency payroll drive, or saved you hours of manual bench troubleshooting, consider buying a coffee or sponsoring development:
+
+* **[☕ Say Thanks via PayPal](https://www.paypal.com/ncp/payment/EKH76RTYHH24S?uhm=MWBA)**
+* **[💖 Sponsor on GitHub Sponsors](https://github.com/sponsors/remarkablepc?uhm=MWBA)**
+
+---
+
 ## 📄 License
 
 MWBA is licensed under the [MIT License](LICENSE).  
 Copyright (c) 2026 Remarkable PC / J. David Hewitt.
+
