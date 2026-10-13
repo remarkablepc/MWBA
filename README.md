@@ -216,7 +216,7 @@ Scholars, bench technicians, and bipartisan IT committees have long debated how 
 Field observations, technician rescue stories, and recovery diagnostics are hosted on GitHub Discussions:
 * **[GitHub Discussions](https://github.com/remarkablepc/MWBA/discussions)**
 
-*(Note: MWBA is an independent, free open-source passion project provided as-is without individual, 1-on-1 technical support. Technicians and administrators are encouraged to collaborate and share field notes in the discussion forum).*
+*(Note: MWBA is independent, free open-source software provided as-is without individual, 1-on-1 technical support. Technicians and administrators are encouraged to collaborate and share field notes in the discussion forum).*
 
 ---
 
