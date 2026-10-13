@@ -2,7 +2,7 @@
 
 Thank you for using **MWBA (Make Windows Bootable Again)**!
 
-## Passion Project Notice & Support Boundary
+## Open Source Notice & Support Boundary
 
 MWBA is an independent, free open-source bench utility created and maintained by **David @ RemarkablePC**. 
 
