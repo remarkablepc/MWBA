@@ -11,7 +11,8 @@ param(
     [string]$OfflineWindowsDrive,
     [string]$LogPath,
     [switch]$AutoConfirmStage2,
-    [switch]$ShowLowConfidence
+    [switch]$ShowLowConfidence,
+    [switch]$DeployWithWintools
 )
 
 $Script:MWBA_Version = '0.2.0'
@@ -337,13 +338,482 @@ function Detect-MWBA-BootStatus {
 }
 
 # Non-destructive suggestion generator for SFC/DISM
-# Produces conservative, technician-facing recommendations and includes
-# suggested offline syntax for DISM (with/without source). Does NOT run tools.
+# Target OS Fingerprinting helper for MWBA & WINTools
+function Get-MWBA-TargetOSInfo {
+    param([string]$TargetDrive = 'C:')
+
+    $cleanDrive = $TargetDrive.TrimEnd(':\') + ":"
+    $info = [ordered]@{
+        Drive           = $cleanDrive
+        Detected        = $false
+        ProductName     = 'Unknown Windows'
+        EditionID       = 'Professional'
+        CurrentBuild    = 0
+        DisplayVersion  = ''
+        UBR             = 0
+        OSFamily        = 'Win11'
+        Architecture    = 'x64'
+        DetectionMethod = 'Default'
+    }
+
+    # 1. If target drive is the currently running Windows host
+    if ($cleanDrive -ieq $env:SystemDrive) {
+        try {
+            $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+            if ($reg) {
+                if ($reg.ProductName)    { $info.ProductName    = [string]$reg.ProductName }
+                if ($reg.EditionID)      { $info.EditionID      = [string]$reg.EditionID }
+                if ($reg.CurrentBuild)   { $info.CurrentBuild   = [int]$reg.CurrentBuild }
+                elseif ($reg.CurrentBuildNumber) { $info.CurrentBuild = [int]$reg.CurrentBuildNumber }
+                if ($reg.DisplayVersion) { $info.DisplayVersion = [string]$reg.DisplayVersion }
+                elseif ($reg.ReleaseId)  { $info.DisplayVersion = [string]$reg.ReleaseId }
+                if ($reg.UBR)            { $info.UBR            = [int]$reg.UBR }
+
+                $info.OSFamily = if ($info.CurrentBuild -ge 22000) { 'Win11' } else { 'Win10' }
+                $info.Detected = $true
+                $info.DetectionMethod = 'OnlineHost'
+                return [PSCustomObject]$info
+            }
+        } catch {}
+    }
+
+    # 2. Offline Registry probe
+    $swHive = Join-Path $cleanDrive "Windows\System32\config\SOFTWARE"
+    $hiveExists = $false
+    try { $hiveExists = Test-Path $swHive -PathType Leaf -ErrorAction SilentlyContinue } catch { $hiveExists = $false }
+
+    if ($hiveExists) {
+        $mountKey = "MWBA_OSProbe_SW"
+        try {
+            & reg.exe unload "HKLM\$mountKey" 2>$null | Out-Null
+            $loadOut = & reg.exe load "HKLM\$mountKey" "$swHive" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $subKey = "HKLM:\$mountKey\Microsoft\Windows NT\CurrentVersion"
+                if (Test-Path $subKey) {
+                    $reg = Get-ItemProperty -Path $subKey -ErrorAction SilentlyContinue
+                    if ($reg.ProductName)    { $info.ProductName    = [string]$reg.ProductName }
+                    if ($reg.EditionID)      { $info.EditionID      = [string]$reg.EditionID }
+                    if ($reg.CurrentBuild)   { $info.CurrentBuild   = [int]$reg.CurrentBuild }
+                    elseif ($reg.CurrentBuildNumber) { $info.CurrentBuild = [int]$reg.CurrentBuildNumber }
+                    if ($reg.DisplayVersion) { $info.DisplayVersion = [string]$reg.DisplayVersion }
+                    elseif ($reg.ReleaseId)  { $info.DisplayVersion = [string]$reg.ReleaseId }
+                    if ($reg.UBR)            { $info.UBR            = [int]$reg.UBR }
+
+                    $info.OSFamily = if ($info.CurrentBuild -ge 22000) { 'Win11' } else { 'Win10' }
+                    $info.Detected = $true
+                    $info.DetectionMethod = 'OfflineRegistry'
+                }
+            }
+        } catch {
+        } finally {
+            try { & reg.exe unload "HKLM\$mountKey" 2>$null | Out-Null } catch {}
+        }
+    }
+
+    # 3. Binary fallback if offline registry could not be mounted
+    if (-not $info.Detected) {
+        $ntoskrnl = Join-Path $cleanDrive "Windows\System32\ntoskrnl.exe"
+        if (Test-Path $ntoskrnl -PathType Leaf -ErrorAction SilentlyContinue) {
+            try {
+                $vi = (Get-Item $ntoskrnl).VersionInfo
+                $bld = $vi.FileBuildPart
+                $info.CurrentBuild = $bld
+                $info.OSFamily = if ($bld -ge 22000) { 'Win11' } else { 'Win10' }
+                $info.ProductName = if ($bld -ge 22000) { "Windows 11 ($bld)" } else { "Windows 10 ($bld)" }
+                $info.Detected = $true
+                $info.DetectionMethod = 'KernelBinary'
+            } catch {}
+        }
+    }
+
+    return [PSCustomObject]$info
+}
+
+# Automated Windows ISO, WIM & ESD Discovery Engine
+# Checks all attached disks, multi-boot USBs (Ventoy, Easy2Boot), and WINTools caches
+function Find-MWBA-WindowsSourceImage {
+    param(
+        [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
+        [switch]$AutoMount
+    )
+
+    if (-not $OfflineWindowsDrive) { $OfflineWindowsDrive = "C:" }
+    $targetOS = Get-MWBA-TargetOSInfo -TargetDrive $OfflineWindowsDrive
+
+    $candidateFiles = @()
+
+    # 1. Probe all connected drives for standard Multi-Boot & setup structures
+    $drives = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID }
+    foreach ($d in $drives) {
+        $let = $d.DeviceID
+        $probeDirs = @(
+            "$let\sources",
+            "$let\_ISO\WINDOWS\WIN11",
+            "$let\_ISO\WINDOWS\WIN10",
+            "$let\_ISO\WINDOWS",
+            "$let\_ISO\WINPE",
+            "$let\ISOs\Windows",
+            "$let\ISOs\WinPE",
+            "$let\ISOs\Backup",
+            "$let\ISOs",
+            "$let\ISO",
+            "$let\ISO_Downloads",
+            "$let\SystemRecovery",
+            "$let\WINBARS_BACKUP\SystemImages"
+        )
+        foreach ($pd in $probeDirs) {
+            if (Test-Path $pd -PathType Container -ErrorAction SilentlyContinue) {
+                $files = Get-ChildItem -Path $pd -Include "*.iso","*.wim","*.esd" -Recurse -File -Depth 2 -ErrorAction SilentlyContinue
+                foreach ($f in $files) {
+                    $candidateFiles += [PSCustomObject]@{
+                        Path        = $f.FullName
+                        Name        = $f.Name
+                        Extension   = $f.Extension.ToLower()
+                        SizeGB      = [math]::Round($f.Length / 1GB, 2)
+                        Directory   = $f.DirectoryName
+                        Drive       = $let
+                    }
+                }
+            }
+        }
+
+        # Check loose install.wim/esd at root\sources
+        foreach ($loose in @("$let\sources\install.wim", "$let\sources\install.esd")) {
+            if (Test-Path $loose -PathType Leaf -ErrorAction SilentlyContinue) {
+                $item = Get-Item $loose
+                $candidateFiles += [PSCustomObject]@{
+                    Path        = $item.FullName
+                    Name        = $item.Name
+                    Extension   = $item.Extension.ToLower()
+                    SizeGB      = [math]::Round($item.Length / 1GB, 2)
+                    Directory   = $item.DirectoryName
+                    Drive       = $let
+                }
+            }
+        }
+    }
+
+    # 2. Probe WINTools local cache and technician download directories
+    $localDirs = @(
+        (Join-Path $env:USERPROFILE "Downloads\WINTools_Cache"),
+        (Join-Path $env:USERPROFILE "Downloads"),
+        (Join-Path $env:USERPROFILE "Documents\ISOs"),
+        "C:\ISO_Downloads",
+        "D:\ISO_Downloads",
+        "C:\ISO",
+        "D:\ISO"
+    )
+    $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
+    if ($scriptRoot) {
+        $parent = Split-Path -Parent $scriptRoot
+        $localDirs += (Join-Path $parent "WINTools\cache\iso")
+        $localDirs += (Join-Path $parent "WINTools\cache\on_demand_tools")
+        $localDirs += (Join-Path $parent "iso")
+    }
+
+    foreach ($ld in $localDirs | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) {
+        $files = Get-ChildItem -Path $ld -Include "*.iso","*.wim","*.esd" -Recurse -File -Depth 2 -ErrorAction SilentlyContinue
+        foreach ($f in $files) {
+            $candidateFiles += [PSCustomObject]@{
+                Path        = $f.FullName
+                Name        = $f.Name
+                Extension   = $f.Extension.ToLower()
+                SizeGB      = [math]::Round($f.Length / 1GB, 2)
+                Directory   = $f.DirectoryName
+                Drive       = (Split-Path $f.FullName -Qualifier)
+            }
+        }
+    }
+
+    # Deduplicate candidates safely
+    $uniqueCandidates = @()
+    if ($candidateFiles.Count -gt 0) {
+        $uniqueCandidates = @($candidateFiles | Group-Object -Property Path | ForEach-Object { $_.Group[0] })
+    }
+
+    # 3. Score and Match Candidates against Target OS
+    $scored = @()
+    foreach ($c in $uniqueCandidates) {
+        $score = 0
+        $matchTag = "Generic"
+        $lowerName = $c.Name.ToLower()
+        $lowerPath = $c.Path.ToLower()
+
+        if ($lowerName -match "linux|ubuntu|debian|mint|arch|pclos|q4os|trixie|slitaz|freebsd|clonezilla|rescuezilla|partexpert") {
+            continue
+        }
+        if ($lowerName -match "boot\.wim|winre\.wim|safeos\.wim|efisys|bootsect") {
+            continue
+        }
+        if ($lowerName -match "^windows.*-kb\d+|microsoft-windows-.*-package") {
+            continue
+        }
+
+        if ($lowerName -match "install\.wim|install\.esd") {
+            $score += 60
+        }
+        if ($c.SizeGB -ge 2.5) {
+            $score += 25
+        } elseif ($c.SizeGB -lt 1.0 -and $c.Extension -in @(".wim", ".esd")) {
+            $score -= 40
+        }
+
+        if ($targetOS.OSFamily -eq 'Win11') {
+            if ($lowerName -match "win11|windows\s*11|windows11|22621|22631|26100|26200|24h2|23h2|22h2") {
+                $score += 50
+                $matchTag = "Win11 Match"
+            } elseif ($lowerName -match "win10|windows\s*10|windows10|19045") {
+                $score += 10
+                $matchTag = "Win10 Fallback"
+            }
+        } else {
+            if ($lowerName -match "win10|windows\s*10|windows10|19041|19042|19044|19045|22h2|21h2") {
+                $score += 50
+                $matchTag = "Win10 Match"
+            } elseif ($lowerName -match "win11|windows\s*11|windows11") {
+                $score += 10
+                $matchTag = "Win11 Fallback"
+            }
+        }
+
+        if ($c.Extension -eq ".wim") { $score += 20 }
+        elseif ($c.Extension -eq ".esd") { $score += 15 }
+        elseif ($c.Extension -eq ".iso") { $score += 10 }
+
+        if ($lowerName -match "winpe|strelec|f4ubcd|falcon|hiren|bootcd|medicat") {
+            $score -= 20
+        }
+
+        $locCategory = "Other"
+        if ($lowerPath -match "_iso\\windows") { $locCategory = "Easy2Boot/Multi-Boot USB" }
+        elseif ($lowerPath -match "isos\\windows") { $locCategory = "Ventoy USB" }
+        elseif ($lowerPath -match "wintools_cache|\\cache\\") { $locCategory = "WINTools Cache" }
+        elseif ($lowerPath -match "sources\\install\.") { $locCategory = "Live Setup Media" }
+        elseif ($lowerPath -match "iso_downloads|\\iso\\") { $locCategory = "Bench ISO Store" }
+
+        $scored += [PSCustomObject]@{
+            Path        = $c.Path
+            Name        = $c.Name
+            Extension   = $c.Extension
+            SizeGB      = $c.SizeGB
+            Score       = $score
+            Category    = $locCategory
+            MatchTag    = $matchTag
+            Drive       = $c.Drive
+        }
+    }
+
+    $sorted = $scored | Sort-Object Score -Descending
+    $bestMatch = if ($sorted.Count -gt 0 -and $sorted[0].Score -gt 0) { $sorted[0] } else { $null }
+    $resolvedSourcePath = $null
+    $matchedIndex = 1
+    $matchedEdition = "Windows Setup Default"
+    $isoMounted = $false
+    $mountedVolumeLetter = $null
+
+    if ($bestMatch) {
+        if ($bestMatch.Extension -in @(".wim", ".esd")) {
+            $resolvedSourcePath = $bestMatch.Path
+        } elseif ($bestMatch.Extension -eq ".iso" -and $AutoMount) {
+            try {
+                $mountRes = Mount-DiskImage -ImagePath $bestMatch.Path -StorageType ISO -PassThru -ErrorAction Stop
+                $mountedVolumeLetter = (Get-DiskImage -ImagePath $bestMatch.Path | Get-Volume).DriveLetter
+                if ($mountedVolumeLetter) {
+                    $isoMounted = $true
+                    $wPath = "$($mountedVolumeLetter):\sources\install.wim"
+                    if (-not (Test-Path $wPath)) { $wPath = "$($mountedVolumeLetter):\sources\install.esd" }
+                    if (Test-Path $wPath) { $resolvedSourcePath = $wPath }
+                }
+            } catch {}
+        }
+
+        $imageToInspect = if ($resolvedSourcePath) { $resolvedSourcePath } else { $null }
+        if ($imageToInspect -and (Test-Path $imageToInspect)) {
+            try {
+                $wimImages = Get-WindowsImage -ImagePath $imageToInspect -ErrorAction SilentlyContinue
+                if ($wimImages) {
+                    $targetEd = $targetOS.EditionID
+                    $matchImg = $wimImages | Where-Object { $_.EditionId -ieq $targetEd -or $_.ImageName -match $targetEd } | Select-Object -First 1
+                    if (-not $matchImg -and $targetEd -match "Pro") {
+                        $matchImg = $wimImages | Where-Object { $_.ImageName -match "Pro" } | Select-Object -First 1
+                    }
+                    if ($matchImg) {
+                        $matchedIndex = $matchImg.ImageIndex
+                        $matchedEdition = $matchImg.ImageName
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    $dismSourceArg = ""
+    $dismRepairCmd = ""
+    $dismDeployCmd = ""
+
+    if ($resolvedSourcePath) {
+        $dismSourceArg = "/Source:wim:`"$resolvedSourcePath`":$matchedIndex /LimitAccess"
+        $dismRepairCmd = "dism.exe /Image:$OfflineWindowsDrive\ /Cleanup-Image /RestoreHealth $dismSourceArg"
+        $dismDeployCmd = "dism.exe /Apply-Image /ImageFile:`"$resolvedSourcePath`" /Index:$matchedIndex /ApplyDir:$OfflineWindowsDrive\"
+    } elseif ($bestMatch -and $bestMatch.Extension -eq ".iso") {
+        $dismRepairCmd = "# Mount '$($bestMatch.Path)' first, then run:`ndism.exe /Image:$OfflineWindowsDrive\ /Cleanup-Image /RestoreHealth /Source:wim:`"<MOUNTED_DRIVE>:\sources\install.wim`":$matchedIndex /LimitAccess"
+        $dismDeployCmd = "# Mount '$($bestMatch.Path)' first, then run:`ndism.exe /Apply-Image /ImageFile:`"<MOUNTED_DRIVE>:\sources\install.wim`" /Index:$matchedIndex /ApplyDir:$OfflineWindowsDrive\"
+    }
+
+    return [PSCustomObject]@{
+        TargetOS            = $targetOS
+        FoundSources        = $sorted
+        BestMatch           = $bestMatch
+        ResolvedSourcePath  = $resolvedSourcePath
+        MatchedIndex        = $matchedIndex
+        MatchedEdition      = $matchedEdition
+        IsoMounted          = $isoMounted
+        MountedDriveLetter  = $mountedVolumeLetter
+        DismSourceArg       = $dismSourceArg
+        DismRepairCommand   = $dismRepairCmd
+        DismDeployCommand   = $dismDeployCmd
+    }
+}
+
+# ==============================================================================
+# WINTools On-Demand Bridge & Rebuild Handoff Engine
+# Reciprocates WINTools' Ensure-MWBAEngine to provide 1-click in-place rebuilds
+# ==============================================================================
+function Find-MWBA-WINToolsEngine {
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { (Get-Location).Path }
+    $parentDir = Split-Path -Parent $scriptDir -ErrorAction SilentlyContinue
+
+    $candidates = @()
+    if ($parentDir) { $candidates += "$parentDir\WINTools" }
+    $candidates += "$scriptDir\cache\on_demand_tools\wintools"
+    $candidates += "$scriptDir\cache\jit_tools\wintools"
+    $candidates += "C:\Tools\WINTools"
+    $candidates += "C:\Utils\WINTools"
+    $candidates += "N:\PCUtils\ProgramFiles\Portable\WINTools"
+
+    # Check all connected logical drives for \WINTools and \Tools\WINTools
+    $drives = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID }
+    foreach ($d in $drives) {
+        $candidates += "$($d.DeviceID)\WINTools"
+        $candidates += "$($d.DeviceID)\Tools\WINTools"
+    }
+
+    foreach ($cand in ($candidates | Select-Object -Unique)) {
+        if (Test-Path "$cand\bin\winwimdeploy.ps1" -ErrorAction SilentlyContinue) {
+            return $cand
+        }
+        if (Test-Path "$cand\wintools.ps1" -ErrorAction SilentlyContinue) {
+            return $cand
+        }
+    }
+    return $null
+}
+
+function Ensure-MWBA-WINToolsEngine {
+    $found = Find-MWBA-WINToolsEngine
+    if ($found) { return $found }
+
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { (Get-Location).Path }
+    $parentDir = Split-Path -Parent $scriptDir -ErrorAction SilentlyContinue
+
+    $targetDir = if ($parentDir -and (Test-Path $parentDir -ErrorAction SilentlyContinue)) { "$parentDir\WINTools" } else { "$scriptDir\cache\on_demand_tools\wintools" }
+
+    Write-Host "`n[-] Standalone WINTools workbench was not found on local or connected drives." -ForegroundColor Yellow
+    Write-Host "    WINTools is decoupled from MWBA and available On Demand from GitHub." -ForegroundColor DarkGray
+    $fetch = Read-Host "    Download WINTools from GitHub On Demand now? [Y/N]"
+    if ($fetch -notmatch '^[Yy]') { return $null }
+
+    # 1. Attempt git clone
+    if (Get-Command git.exe -ErrorAction SilentlyContinue) {
+        Write-Host "  [+] Cloning WINTools repository into $targetDir..." -ForegroundColor Cyan
+        & git clone https://github.com/remarkablepc/WINTools.git "$targetDir"
+        if (Test-Path "$targetDir\bin\winwimdeploy.ps1") {
+            Write-Host "  [OK] WINTools fetched successfully On Demand via git!" -ForegroundColor Green
+            return $targetDir
+        }
+    }
+
+    # 2. Fallback to HTTPS ZIP download
+    try {
+        Write-Host "  [+] Downloading WINTools archive from GitHub On Demand..." -ForegroundColor Cyan
+        $zipUrl = "https://github.com/remarkablepc/WINTools/archive/refs/heads/main.zip"
+        $cacheDir = Join-Path $scriptDir "cache"
+        if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+        $zipFile = Join-Path $cacheDir "wintools_latest.zip"
+
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        $webClient = New-Object System.Net.WebClient
+        $webClient.DownloadFile($zipUrl, $zipFile)
+
+        if (Test-Path $zipFile) {
+            Write-Host "  [+] Extracting WINTools archive..." -ForegroundColor Cyan
+            $extractTmp = Join-Path $cacheDir "wintools_extracted"
+            if (Test-Path $extractTmp) { Remove-Item $extractTmp -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $zipFile -DestinationPath $extractTmp -Force
+
+            $innerDir = Join-Path $extractTmp "WINTools-main"
+            if (-not (Test-Path $innerDir)) { $innerDir = $extractTmp }
+
+            if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            Copy-Item -Path "$innerDir\*" -Destination $targetDir -Recurse -Force
+            Remove-Item $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path "$targetDir\bin\winwimdeploy.ps1") {
+                Write-Host "  [OK] WINTools downloaded and extracted successfully On Demand!" -ForegroundColor Green
+                return $targetDir
+            }
+        }
+    } catch {
+        Write-Host "  [-] Failed to download WINTools: $_" -ForegroundColor Red
+    }
+
+    return $null
+}
+
+function Invoke-MWBA-WINToolsDeploy {
+    param(
+        [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
+        [string]$SourceImage = ""
+    )
+    $wintoolsRoot = Ensure-MWBA-WINToolsEngine
+    if (-not $wintoolsRoot) {
+        Write-Host "[-] WINTools could not be located or downloaded. Handoff aborted." -ForegroundColor Red
+        return $false
+    }
+
+    $deployScript = Join-Path $wintoolsRoot "bin\winwimdeploy.ps1"
+    if (-not (Test-Path $deployScript)) {
+        Write-Host "[-] winwimdeploy.ps1 not found in $wintoolsRoot\bin\" -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host "`n  ==========================================================================" -ForegroundColor Cyan
+    Write-Host "   HANDING OFF TO WINTOOLS IN-PLACE REBUILD (winwimdeploy.ps1)" -ForegroundColor White
+    Write-Host "   Target Destination : $OfflineWindowsDrive" -ForegroundColor Green
+    if ($SourceImage) {
+        Write-Host "   Source Image       : $SourceImage" -ForegroundColor Yellow
+    }
+    Write-Host "  ==========================================================================" -ForegroundColor Cyan
+
+    $deployArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $deployScript)
+    if ($OfflineWindowsDrive) {
+        $deployArgs += @("-TargetDrive", $OfflineWindowsDrive)
+    }
+    if ($SourceImage) {
+        $deployArgs += @("-SourceImage", $SourceImage)
+    }
+
+    & powershell.exe $deployArgs
+    return ($LASTEXITCODE -eq 0)
+}
+
+# Non-destructive suggestion generator for SFC/DISM
+# Auto-detects matching Windows source media across Ventoy, Easy2Boot & WINTools caches
 function Get-MWBA-SfcDismSuggestion {
     param(
         [Parameter(Mandatory=$true)] [PSCustomObject]$BootStatus,
         [string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive,
-        [string[]]$SearchDrives = @('D:','E:','F:','G:','H:')
+        [string[]]$SearchDrives = @()
     )
 
     function Map-ScoreToConfidence { param($score)
@@ -352,19 +822,9 @@ function Get-MWBA-SfcDismSuggestion {
         else { 'Low' }
     }
 
-    # Probe common removable/media drives for install.wim/install.esd
-    $foundSource = $null
-    foreach ($d in $SearchDrives) {
-        $driveName = $d.TrimEnd(':')
-        if (-not (Get-PSDrive -Name $driveName -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
-            continue
-        }
-        foreach ($name in @('sources\install.wim','sources\install.esd')) {
-            $p = Join-Path $d $name
-            if (Test-Path $p -PathType Leaf -ErrorAction SilentlyContinue) { $foundSource = (Get-Item $p).FullName; break }
-        }
-        if ($foundSource) { break }
-    }
+    # Auto-detect matching Windows ISO/WIM/ESD source media
+    $discovery = Find-MWBA-WindowsSourceImage -OfflineWindowsDrive $OfflineWindowsDrive
+    $foundSource = if ($discovery.BestMatch) { $discovery.BestMatch.Path } else { $null }
 
     # Extract indicators from boot status details (safe access)
     $details = $BootStatus.Details
@@ -391,27 +851,28 @@ function Get-MWBA-SfcDismSuggestion {
     $sfcRec = if ($sfcConfidence -eq 'Low') { 'SFC is unlikely to help now; address missing boot files or unlock BitLocker first.' } else { 'Consider running offline SFC to repair system files (non-destructive).' }
     $sfcWhy = if (-not $winload) { 'Critical boot files missing; SFC cannot recreate missing bootloader files.' } elseif ($pending) { 'Pending/incomplete updates detected which may have left system files inconsistent.' } else { 'Boot-critical files present but boot remains unhealthy; integrity check may repair damaged files.' }
 
-    # DISM heuristic (conservative)
+    # DISM heuristic with intelligent source scoring
     $dismScore = 0
     if ($pending) { $dismScore += 1 }
-    if ($foundSource) { $dismScore += 2 }
+    if ($foundSource) { $dismScore += 3 } # Strong confidence boost when matching image detected
     if ($winload) { $dismScore += 1 }
     if ($bitlocker) { $dismScore -= 1 }
     if (-not $bcdOk) { $dismScore -= 1 }
     $dismConfidence = Map-ScoreToConfidence $dismScore
 
     $dismTime = '20-60 minutes (depends on disk speed and health)'
-    $dismCmdNoSource = "dism /Image:$OfflineWindowsDrive /Cleanup-Image /RestoreHealth"
-    $dismCmdWithSource = "dism /Image:$OfflineWindowsDrive /Cleanup-Image /RestoreHealth /Source:wim:<PATH>:<INDEX> /LimitAccess"
+    $dismCmdNoSource = "dism /Image:$OfflineWindowsDrive\ /Cleanup-Image /RestoreHealth"
 
     if ($foundSource) {
-        $dismRec = 'DISM with a matching install.wim/esd source is recommended when SFC cannot repair component store issues.'
-        $dismWhy = 'A local install image was detected; DISM can repair the component store using that source.'
+        $dismRec = "DISM with auto-detected $($discovery.BestMatch.Name) ($($discovery.BestMatch.Category)) is strongly recommended."
+        $dismWhy = "Matched target OS ($($discovery.TargetOS.ProductName)) with source media at $($discovery.BestMatch.Path)."
         $dismSource = $foundSource
+        $suggestedDismCmd = if ($discovery.DismRepairCommand) { $discovery.DismRepairCommand } else { "dism /Image:$OfflineWindowsDrive\ /Cleanup-Image /RestoreHealth /Source:wim:`"$foundSource`":$($discovery.MatchedIndex) /LimitAccess" }
     } else {
-        $dismRec = 'DISM can be attempted without a local source, but success is less likely; obtain matching install media for best results.'
-        $dismWhy = 'No local install.wim/esd found on common media; prefer providing matching source before running DISM.'
+        $dismRec = 'DISM can be attempted without a local source, but success is less likely; provide matching media for best results.'
+        $dismWhy = 'No matching install.wim/esd or ISO found in standard WINTools, Ventoy, or Easy2Boot locations.'
         $dismSource = $null
+        $suggestedDismCmd = $dismCmdNoSource
     }
 
     $suggestions = @()
@@ -429,10 +890,10 @@ function Get-MWBA-SfcDismSuggestion {
         Tool = 'DISM'
         Confidence = $dismConfidence
         TimeEstimate = $dismTime
-        SourceAvailability = if ($dismSource) { @{ Available = $true; Path = $dismSource } } else { @{ Available = $false } }
+        SourceAvailability = if ($dismSource) { @{ Available = $true; Path = $dismSource; Category = $discovery.BestMatch.Category; MatchedIndex = $discovery.MatchedIndex } } else { @{ Available = $false } }
         Recommendation = $dismRec
         Explanation = $dismWhy
-        SuggestedCommand = if ($dismSource) { $dismCmdWithSource -replace '<PATH>',$dismSource -replace '<INDEX>','1' } else { $dismCmdNoSource }
+        SuggestedCommand = $suggestedDismCmd
         UndoHint = 'DISM modifies component store; keep logs in %windir%\Logs\DISM\dism.log for review.'
     }
 
@@ -620,7 +1081,16 @@ function Show-MWBA-StopLossAdvisory {
     Write-Host "  [1] Preserve Customer Data (First Priority):" -ForegroundColor Cyan
     Write-Host "      Copy $OfflineWindowsDrive\Users to technician bench backup drive or network share." -ForegroundColor White
     Write-Host "  [2] Semi-Clean Deployment (Preserves unformatted files in Users):" -ForegroundColor Cyan
-    Write-Host "      dism.exe /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:$OfflineWindowsDrive\" -ForegroundColor White
+    $matchedSource = Find-MWBA-WindowsSourceImage -OfflineWindowsDrive $OfflineWindowsDrive
+    if ($matchedSource -and $matchedSource.BestMatch) {
+        Write-Host "      Auto-Detected Source: $($matchedSource.BestMatch.Name) ($($matchedSource.BestMatch.Category))" -ForegroundColor Yellow
+        if ($matchedSource.DismDeployCommand) {
+            Write-Host "      $($matchedSource.DismDeployCommand)" -ForegroundColor White
+        }
+    } else {
+        Write-Host "      dism.exe /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:$OfflineWindowsDrive\" -ForegroundColor White
+    }
+    Write-Host "      [★] WINTools Action: Menu 6 -> Tool #35 (winwimdeploy.ps1) automates this in 1 click (driver harvest & Wi-Fi preservation)" -ForegroundColor Cyan
     Write-Host "  [3] Clean Windows Reinstall:" -ForegroundColor Cyan
     Write-Host "      Format target partition and install clean Windows OS." -ForegroundColor White
     Write-Host "  [!] Bench Rule: Stop offline tinkering now. Protect customer data and redeploy." -ForegroundColor Yellow
@@ -1405,6 +1875,17 @@ function Start-MWBA {
         if ($reinstall.ReinstallScore -ge 2) {
             Show-MWBA-StopLossAdvisory -ReinstallReport $reinstall -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
             Write-Host "[!] BENCH STOP-LOSS TRIGGERED: Offline repair beyond this point will not fix Zone 3 / WinSxS collapse." -ForegroundColor Yellow
+
+            $matchedSource = Find-MWBA-WindowsSourceImage -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+            $srcPath = if ($matchedSource -and $matchedSource.ResolvedSourcePath) { $matchedSource.ResolvedSourcePath } elseif ($matchedSource -and $matchedSource.BestMatch) { $matchedSource.BestMatch.Path } else { "" }
+
+            $launchDeploy = Read-Host "`n[★] Launch WINTools in-place non-destructive rebuild now? (Y/N)"
+            if ($launchDeploy -match '^[Yy]') {
+                $deploySuccess = Invoke-MWBA-WINToolsDeploy -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive -SourceImage $srcPath
+                Write-MWBA "WINTools in-place rebuild invoked with success=$deploySuccess"
+                return @{ Success=$deploySuccess; Stage=1; Report=$result; WintoolsDeployed=$true }
+            }
+
             $proceedStage2 = Read-Host "Do you still wish to attempt experimental Stage 2 repairs anyway? (Y/N)"
             if ($proceedStage2 -notmatch '^[Yy]') {
                 Write-MWBA 'Operator accepted Bench Stop-Loss recommendation; aborted before Stage 2.'
@@ -1447,8 +1928,16 @@ function Start-MWBA {
     return @{ Success=$false; Stage=2; Report=$result }
 }
 
-# If executed directly (not dot-sourced), run Start-MWBA with supplied arguments
+# If executed directly (not dot-sourced), run Start-MWBA or invoke WINTools deploy
 if ($MyInvocation.InvocationName -ne '.' -and ($MyInvocation.Line -notmatch '^\s*\.\s+') -and ($MyInvocation.InvocationName -match 'MWBA\.ps1' -or ($PSCommandPath -and (Split-Path $PSCommandPath -Leaf) -eq 'MWBA.ps1'))) {
+    if ($DeployWithWintools) {
+        $targetDrive = Resolve-MWBA-OfflineWindowsDrive -OfflineWindowsDrive $OfflineWindowsDrive
+        $matchedSource = Find-MWBA-WindowsSourceImage -OfflineWindowsDrive $targetDrive
+        $srcPath = if ($matchedSource -and $matchedSource.ResolvedSourcePath) { $matchedSource.ResolvedSourcePath } elseif ($matchedSource -and $matchedSource.BestMatch) { $matchedSource.BestMatch.Path } else { "" }
+        $depResult = Invoke-MWBA-WINToolsDeploy -OfflineWindowsDrive $targetDrive -SourceImage $srcPath
+        exit (if ($depResult) { 0 } else { 1 })
+    }
+
     $splat = @{}
     if ($DryRun) { $splat['DryRun'] = $true }
     if ($OfflineWindowsDrive) { $splat['OfflineWindowsDrive'] = $OfflineWindowsDrive }

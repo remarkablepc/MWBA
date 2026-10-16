@@ -91,6 +91,7 @@ MWBA was engineered specifically for bench technicians, sysadmins, and repair sh
 | **`Restore-OfflineRegistry.ps1`** | Restores offline registry hives (SYSTEM, SOFTWARE, etc.) from VSS shadow copy snapshots | `-OfflineDrive` |
 | **`Set-BootMode.ps1`** | Configures BCD for Normal clean boot or Safe Mode with Networking (`-Mode Normal` / `SafeNetwork`) | `-TargetDrive`, `-Mode`, `-DisableBootLog` |
 | **`Add-DualBootEntry.ps1`** | Bridges target Windows installation into host/reference EFI bootloader menu | `-HostDrive`, `-TargetDrive`, `-TimeoutSeconds` |
+| **`Find-WindowsSourceImage.ps1`** | Auto-discovers Windows ISO/WIM/ESD across Ventoy, Easy2Boot & WINTools caches with OS fingerprinting | `-OfflineWindowsDrive`, `-MountIso`, `-Json` |
 | **`Test-BootInVM.ps1`** | Boots physical disk inside an isolated Gen 2 Hyper-V VM with Secure Boot and auto-cleanup | `-DiskNumber`, `-VmName`, `-RamMB` |
 
 ---
@@ -157,12 +158,18 @@ MWBA deliberately avoids compiling scripts into `.exe` wrappers:
 
 ---
 
-## 🔌 WINTools Integration (On-Demand Discovery)
+## 🔌 WINTools Two-Way Symmetrical On-Demand Bridge
 
-MWBA functions as both an independent repository and an On-Demand module for **[WINTools](https://github.com/remarkablepc/WINTools)**:
-* **Sibling Discovery**: If cloned into `..\MWBA` adjacent to `WINTools`, `winbootdoctor.ps1` automatically detects and uses it.
-* **Portable USB / On-Demand Cache**: Can be pre-staged in `WINTools\cache\bench_tools\mwba`.
-* **Zero Host Pollution**: Adheres to technician bench sterility contracts.
+MWBA and **[WINTools](https://github.com/remarkablepc/WINTools)** form a seamless, decoupled technician pair:
+* **WINTools ➔ MWBA**: WINTools Menu 6 (Tool #27 `winbootdoctor.ps1`) automatically discovers MWBA locally (`..\MWBA`, USB drives) or fetches it On Demand from GitHub for deep bootloader diagnostics.
+* **MWBA ➔ WINTools (Rebuild Handoff)**: When MWBA diagnoses that an unbootable OS has collapsed beyond offline repair (Stop-Loss Safeguard), MWBA discovers any attached Windows install media (`Find-WindowsSourceImage.ps1`) and offers an immediate **1-click handoff to WINTools Menu 6 (`winwimdeploy.ps1`)**.
+* **Zero-Transfer In-Place Rebuild**: Leaves `C:\Users` 100% in place, harvests third-party INF hardware drivers and Wi-Fi profiles, archives old system folders to `.old`, applies a fresh Windows image via DISM, and reinjects drivers for seamless first-boot recovery.
+* **Direct CLI Invocations**:
+  ```powershell
+  # Launch WINTools in-place rebuild directly from MWBA with auto-detected media:
+  powershell.exe -ExecutionPolicy Bypass -File .\MWBA.ps1 -OfflineWindowsDrive C: -DeployWithWintools
+  ```
+* **Zero Host Pollution**: Adheres to technician bench sterility contracts with 100% decoupling.
 
 ---
 

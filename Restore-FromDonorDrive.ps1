@@ -12,8 +12,8 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$DonorDrive,
+    [Parameter(Mandatory=$false)]
+    [string]$DonorDrive = "",
     
     [string]$TargetDrive = "",
     [string]$LogFile = "",
@@ -41,8 +41,21 @@ if (-not $TargetDrive) {
     if (-not $TargetDrive) { $TargetDrive = "E:" }
 }
 
+# Dynamic Donor Resolution
+if (-not $DonorDrive) {
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if ($drive.IsReady -and (Test-Path "$($drive.RootDirectory.FullName)Windows\System32\ntoskrnl.exe")) {
+            $cand = $drive.Name.TrimEnd('\')
+            if ($cand -ne $TargetDrive.TrimEnd(':\') -and $cand -notmatch "^C:") {
+                $DonorDrive = $cand
+                break
+            }
+        }
+    }
+}
+
 $cleanTarget = $TargetDrive.TrimEnd(':\') + ":"
-$cleanDonor  = $DonorDrive.TrimEnd(':\') + ":"
+$cleanDonor  = if ($DonorDrive) { $DonorDrive.TrimEnd(':\') + ":" } else { "" }
 
 if (-not $LogFile) {
     $logDir = Join-Path $PSScriptRoot "logs"
@@ -181,8 +194,19 @@ function Invoke-CatalogRobocopy {
 # -------------------------------------------------------------------------
 Enable-MWBAPrivileges
 
-if (-not (Test-Path "$cleanDonor\Windows\System32")) {
-    Log "PREFLIGHT" "Donor drive $cleanDonor\Windows\System32 is not accessible!" "-"
+if (-not $cleanDonor -or -not (Test-Path "$cleanDonor\Windows\System32")) {
+    Log "PREFLIGHT" "Donor drive '$cleanDonor\Windows\System32' is not accessible!" "-"
+    $srcFinder = Join-Path $PSScriptRoot "Find-WindowsSourceImage.ps1"
+    if (Test-Path $srcFinder) {
+        Log "PREFLIGHT" "Probing standard WINTools, Ventoy & Easy2Boot media for candidate images..." "*"
+        try {
+            $disc = & powershell -NoProfile -ExecutionPolicy Bypass -File "$srcFinder" -OfflineWindowsDrive $cleanTarget -Json | ConvertFrom-Json
+            if ($disc.BestMatch) {
+                Log "PREFLIGHT" "Detected matching image: $($disc.BestMatch.Name) at $($disc.BestMatch.Path)" ">"
+                Log "PREFLIGHT" "To use as donor: mount image or run .\Find-WindowsSourceImage.ps1 -MountIso" ">"
+            }
+        } catch {}
+    }
     exit 1
 }
 if (-not (Test-Path "$cleanTarget\Windows\System32")) {
