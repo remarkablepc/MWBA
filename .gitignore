@@ -1,0 +1,79 @@
+# MWBA .gitignore - keep sensitive, bench, and private artifacts out of the repo
+
+# Private & Maintainer Scripts
+push-to-github.ps1
+*push*.ps1
+*deploy*.ps1
+*publish*.ps1
+*private*.ps1
+*.secret.ps1
+
+# PowerShell & Editor / IDE
+*.ps1xml
+.vscode/
+.vs/
+.idea/
+*.user
+*.suo
+*.code-workspace
+
+# Logs, Runs, Dumps & Temp
+*.log
+*.tmp
+*.temp
+*.cache
+tmp/
+*.local
+logs/
+*.dmp
+*.DMP
+ntbtlog.txt
+minidump/
+dumps/
+
+# Forensics, Registry Exports & Backups
+*.bak
+*.hiv
+*.reg
+
+# VM, Disks & Media (bench testing)
+*.vhd
+*.vhdx
+*.vmdk
+*.vdi
+*.iso
+*.qcow2
+
+# Secrets & Keys (Do NOT commit BitLocker recovery keys or credentials)
+*BitLocker*
+*recovery*.txt
+*.key
+*.pfx
+*.pem
+*.asc
+*.secret
+*.token
+*.creds
+
+# Build outputs & runtimes
+*.exe
+*.dll
+*.msi
+*.zip
+*.7z
+bin/
+obj/
+dotnet-runtime/
+
+# Cloud Sync & OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.dropbox*
+*.dropbox.attr
+.insync*
+*.sync
+*conflicted copy*
+*.conflict
+* ([0-9])*
+* ([0-9]).*
