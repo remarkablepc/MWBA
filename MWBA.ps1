@@ -242,6 +242,210 @@ function Get-MWBA-BcdStorePath {
     return $null
 }
 
+# -------------------------------------------------------------------------
+# Boot-Crash, Minidump & Driver Stack Overrun Diagnostics
+# -------------------------------------------------------------------------
+function Find-MWBA-BootCrashInfo {
+    param([string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive)
+    $cleanDrive = ($OfflineWindowsDrive.TrimEnd(':\')) + ":"
+    $winPath = Join-Path $cleanDrive 'Windows'
+
+    $info = [ordered]@{
+        HasCrash          = $false
+        BugCheckHex       = $null
+        BugCheckName      = $null
+        CulpritDriver     = $null
+        DumpCount         = 0
+        LatestDump        = $null
+        PendingXmlPresent = $false
+        CrashTimestamp    = $null
+    }
+
+    if (-not (Test-Path $winPath)) { return [PSCustomObject]$info }
+
+    # Check pending.xml
+    $pending = Join-Path $winPath 'WinSxS\pending.xml'
+    if (Test-Path $pending) {
+        $info.PendingXmlPresent = $true
+    }
+
+    # Known BugChecks dictionary
+    $bugCheckMap = @{
+        '0x000000f7' = 'DRIVER_OVERRUN_STACK_BUFFER'
+        '0x0000007b' = 'INACCESSIBLE_BOOT_DEVICE'
+        '0x00000019' = 'BAD_POOL_HEADER'
+        '0x000000c5' = 'DRIVER_CORRUPTED_EXPOOL'
+        '0x0000000a' = 'IRQL_NOT_LESS_OR_EQUAL'
+        '0x0000003b' = 'SYSTEM_SERVICE_EXCEPTION'
+        '0x000000d1' = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL'
+        '0x00000050' = 'PAGE_FAULT_IN_NONPAGED_AREA'
+        '0x0000007e' = 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED'
+        '0x0000001e' = 'KMODE_EXCEPTION_NOT_HANDLED'
+        '0x00000133' = 'DPC_WATCHDOG_VIOLATION'
+        '0x000000c2' = 'BAD_POOL_CALLER'
+        '0x000000ef' = 'CRITICAL_PROCESS_DIED'
+        '0x00000154' = 'UNEXPECTED_STORE_EXCEPTION'
+        '0x0000009f' = 'DRIVER_POWER_STATE_FAILURE'
+    }
+
+    # Discover dumps in Minidump and root Windows
+    $dumpFiles = @()
+    $miniDir = Join-Path $winPath 'Minidump'
+    if (Test-Path $miniDir) {
+        $dumpFiles += Get-ChildItem -Path $miniDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue
+    }
+    $memDump = Join-Path $winPath 'MEMORY.DMP'
+    if (Test-Path $memDump) {
+        $dumpFiles += Get-Item $memDump -ErrorAction SilentlyContinue
+    }
+
+    $info.DumpCount = $dumpFiles.Count
+
+    if ($dumpFiles.Count -gt 0) {
+        $latest = $dumpFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $info.HasCrash = $true
+        $info.LatestDump = $latest.FullName
+        $info.CrashTimestamp = $latest.LastWriteTime
+
+        # Read binary header if minidump
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($latest.FullName)
+            if ($bytes.Length -ge 1024) {
+                # Look for signature 'PAGE'
+                $sig = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4)
+                if ($sig -eq 'PAGE') {
+                    # 64-bit kernel dump header: BugCheck code at offset 0x14
+                    $code = [System.BitConverter]::ToUInt32($bytes, 0x14)
+                    $hex = ('0x{0:x8}' -f $code).ToLowerInvariant()
+                    $info.BugCheckHex = $hex
+                    if ($bugCheckMap.ContainsKey($hex)) {
+                        $info.BugCheckName = $bugCheckMap[$hex]
+                    } else {
+                        $info.BugCheckName = "BUGCHECK_$hex"
+                    }
+                }
+
+                # Scan raw dump text for candidate 3rd-party .sys drivers
+                $str = [System.Text.Encoding]::ASCII.GetString($bytes)
+                $matches = [regex]::Matches($str, '([a-zA-Z0-9_\-]{3,35}\.sys)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                $candidates = [System.Collections.Generic.List[string]]::new()
+                $systemDrivers = @('ntoskrnl.exe','hal.dll','fltmgr.sys','ntfs.sys','ksecdd.sys','clipsp.sys','werkernel.sys','volmgr.sys','partmgr.sys','mountmgr.sys','pci.sys','acpi.sys','bootvid.dll')
+
+                foreach ($m in $matches) {
+                    $dName = $m.Groups[1].Value.ToLowerInvariant()
+                    if ($systemDrivers -notcontains $dName -and -not $candidates.Contains($dName)) {
+                        $candidates.Add($dName)
+                    }
+                }
+
+                if ($candidates.Count -gt 0) {
+                    $info.CulpritDriver = $candidates[0]
+                }
+            }
+        } catch { }
+
+        # Check offline System.evtx for Event ID 1001 if bugcheck code still unknown
+        if (-not $info.BugCheckHex) {
+            $evtx = Join-Path $winPath 'System32\Winevt\Logs\System.evtx'
+            if (Test-Path $evtx) {
+                try {
+                    $ev = Get-WinEvent -Path $evtx -FilterXPath "*[System[(EventID=1001)] and System[Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting' or @Name='BugCheck']]]" -MaxEvents 1 -ErrorAction SilentlyContinue
+                    if ($ev) {
+                        $msg = $ev.Message
+                        if ($msg -match '0x[0-9a-fA-F]{8}') {
+                            $hex = $Matches[0].ToLowerInvariant()
+                            $info.BugCheckHex = $hex
+                            if ($bugCheckMap.ContainsKey($hex)) {
+                                $info.BugCheckName = $bugCheckMap[$hex]
+                            } else {
+                                $info.BugCheckName = "BUGCHECK_$hex"
+                            }
+                        }
+                    }
+                } catch { }
+            }
+        }
+    }
+
+    return [PSCustomObject]$info
+}
+
+function Triage-MWBA-BootCrash {
+    param([string]$OfflineWindowsDrive = $Script:MWBA_OfflineWindowsDrive)
+    Write-MWBA "Triage-MWBA-BootCrash: checking for boot-phase driver crashes and servicing deadlocks..."
+
+    $crash = Find-MWBA-BootCrashInfo -OfflineWindowsDrive $OfflineWindowsDrive
+    if (-not $crash.HasCrash -and -not $crash.PendingXmlPresent) {
+        Write-MWBA "No boot crashes or pending servicing deadlocks detected."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  ================================================================" -ForegroundColor Yellow
+    Write-Host "   [!] MWBA BOOT-CRASH & DRIVER STACK OVERRUN DETECTED            " -ForegroundColor Yellow
+    Write-Host "  ================================================================" -ForegroundColor Yellow
+
+    if ($crash.HasCrash) {
+        Write-Host "   BugCheck Code  : $($crash.BugCheckHex) ($($crash.BugCheckName))" -ForegroundColor Red
+        if ($crash.CulpritDriver) {
+            Write-Host "   Suspect Driver : $($crash.CulpritDriver)" -ForegroundColor Yellow
+        }
+        Write-Host "   Latest Dump    : $($crash.LatestDump) ($($crash.CrashTimestamp))" -ForegroundColor DarkGray
+        Write-Host "   Total Dumps    : $($crash.DumpCount)" -ForegroundColor DarkGray
+    }
+
+    if ($crash.PendingXmlPresent) {
+        Write-Host "   Servicing Lock : WinSxS\pending.xml is present (interrupted Windows Update)" -ForegroundColor Magenta
+    }
+    Write-Host "  ----------------------------------------------------------------" -ForegroundColor DarkGray
+
+    # 1. Safe Mode Minimal
+    Write-Host "   [+] Safe Mode Minimal bypasses all third-party filter drivers (antivirus, VPN," -ForegroundColor Cyan
+    Write-Host "       storage filters) allowing Windows to reach the desktop safely." -ForegroundColor Cyan
+
+    $armSm = Read-Host "`n   Arm Safe Mode Minimal on $OfflineWindowsDrive for next boot? [Y/n]"
+    if ($armSm -notmatch '^[Nn]') {
+        $bcdStore = "$OfflineWindowsDrive\Boot\BCD"
+        $espInfo = Find-MWBA-TargetDiskESP -OfflineWindowsDrive $OfflineWindowsDrive
+        if ($espInfo -and $espInfo.DriveLetter) {
+            $cand = "$($espInfo.DriveLetter):\EFI\Microsoft\Boot\BCD"
+            if (Test-Path $cand) { $bcdStore = $cand }
+        }
+        if (Test-Path $bcdStore) {
+            & bcdedit.exe /store $bcdStore /set "{default}" safeboot minimal 2>&1 | Out-Null
+            & bcdedit.exe /store $bcdStore /set "{default}" safebootalternateshell No 2>&1 | Out-Null
+            & bcdedit.exe /store $bcdStore /set "{default}" bootmenupolicy legacy 2>&1 | Out-Null
+            Write-MWBA "Safe Mode Minimal successfully armed in $bcdStore."
+            Write-Host "   [OK] Safe Mode Minimal armed successfully!" -ForegroundColor Green
+        } else {
+            & bcdedit.exe /set "{default}" safeboot minimal 2>&1 | Out-Null
+            & bcdedit.exe /set "{default}" bootmenupolicy legacy 2>&1 | Out-Null
+            Write-MWBA "Safe Mode Minimal armed on active system BCD."
+            Write-Host "   [OK] Safe Mode Minimal armed on active system BCD!" -ForegroundColor Green
+        }
+    }
+
+    # 2. Driver Quarantine
+    if ($crash.CulpritDriver) {
+        $drvFile = $crash.CulpritDriver
+        Write-Host "`n   [+] Suspect driver '$drvFile' was extracted from the crash dump." -ForegroundColor Yellow
+        $quar = Read-Host "   Quarantine $drvFile now (renames to .disabled-by-mwba)? [y/N]"
+        if ($quar -match '^[Yy]') {
+            Disable-Driver -DriverFile $drvFile -Confirm:$false
+            Write-Host "   [OK] Driver $drvFile quarantined successfully." -ForegroundColor Green
+        }
+    }
+
+    # 3. pending.xml
+    if ($crash.PendingXmlPresent) {
+        $revert = Read-Host "`n   Defuse pending.xml (rename to .disabled-by-mwba to unstick boot)? [Y/n]"
+        if ($revert -notmatch '^[Nn]') {
+            Cleanup-PendingUpdates -WindowsPath $OfflineWindowsDrive
+            Write-Host "   [OK] pending.xml neutralized." -ForegroundColor Green
+        }
+    }
+}
+
 function Detect-MWBA-BootStatus {
     <#
     Heuristic boot-status detection for offline/WinRE environment.
@@ -323,6 +527,23 @@ function Detect-MWBA-BootStatus {
     $details.CatRoot2FileCount = $catRoot2Count
     if ($catRoot2Count -lt 1) { $reasons.Add("CatRoot2 database empty ($catRoot2Count files) - causes 0xC000021A / STATUS_INVALID_IMAGE_HASH") }
     if ($catRootCount -lt 100) { $reasons.Add("CatRoot catalog store critically depleted ($catRootCount files, expected >= 100) - causes signature verification failures") }
+
+    # 8) Boot-time Crash Dumps & Servicing Deadlocks
+    $crash = Find-MWBA-BootCrashInfo -OfflineWindowsDrive $OfflineWindowsDrive
+    $details.BootCrashDetected = [bool]$crash.HasCrash
+    $details.PendingXmlDeadlock = [bool]$crash.PendingXmlPresent
+    $details.DumpCount = [int]$crash.DumpCount
+    $details.CrashingDriver = $crash.CulpritDriver
+    $details.BugCheck = if ($crash.BugCheckHex) { "$($crash.BugCheckHex) ($($crash.BugCheckName))" } else { $null }
+
+    if ($crash.HasCrash) {
+        $desc = if ($crash.BugCheckName) { "$($crash.BugCheckName) ($($crash.BugCheckHex))" } else { "Unanalyzed Minidump" }
+        $drvNote = if ($crash.CulpritDriver) { " [Suspect: $($crash.CulpritDriver)]" } else { "" }
+        $reasons.Add("Boot crash detected: $desc$drvNote ($($crash.DumpCount) dump file(s) found)")
+    }
+    if ($crash.PendingXmlPresent) {
+        $reasons.Add("Uncommitted servicing transaction deadlock: WinSxS\pending.xml present")
+    }
 
     $status = if ($reasons.Count -eq 0) { 'Healthy' } else { 'Unhealthy' }
     $obj = [PSCustomObject]@{
@@ -1122,19 +1343,33 @@ function Find-MWBA-TargetDiskESP {
     if (-not $OfflineWindowsDrive) { return $null }
 
     try {
-        $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
-        $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
-        if (-not $part) { return $null }
-        $diskNum = $part[0].DiskNumber
-
-        $esp = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue |
-            Where-Object { $_.Type -eq 'System' -or $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' }
-        if ($esp) {
-            return @{ DiskNumber = $diskNum; PartitionNumber = $esp.PartitionNumber; DriveLetter = $esp.DriveLetter }
+        if (-not (Get-Command Get-Partition -ErrorAction SilentlyContinue)) {
+            Import-Module Storage -ErrorAction SilentlyContinue
+        }
+        if (Get-Command Get-Partition -ErrorAction SilentlyContinue) {
+            $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
+            $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
+            if ($part) {
+                $diskNum = $part[0].DiskNumber
+                $esp = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Type -eq 'System' -or $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' }
+                if ($esp) {
+                    return @{ DiskNumber = $diskNum; PartitionNumber = $esp.PartitionNumber; DriveLetter = $esp.DriveLetter }
+                }
+            }
         }
     } catch {
         Write-MWBA "Find-MWBA-TargetDiskESP exception: $($_.Exception.Message)" 'WARN'
     }
+
+    # WinPE Fallback: scan mounted FAT32 system volumes if Get-Partition is unavailable
+    try {
+        $espVols = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.FileSystemType -eq 'FAT32' -and ($_.FileSystemLabel -in @('ESP', 'SYSTEM', 'EFI', 'SYSTEM_DRV')) }
+        if ($espVols) {
+            return @{ DiskNumber = -1; PartitionNumber = -1; DriveLetter = $espVols[0].DriveLetter }
+        }
+    } catch {}
+
     return $null
 }
 
@@ -1228,19 +1463,28 @@ function Ensure-MWBA-TargetDiskOnline {
         [string]$BitLockerKey = $null
     )
     Write-MWBA "Ensure-MWBA-TargetDiskOnline: verifying target disk is online and unlocked..."
-    $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
-    $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
-    if ($part) {
-        $diskNum = $part[0].DiskNumber
-        $diskObj = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
-        if ($diskObj -and $diskObj.IsOffline) {
-            if ($Script:MWBA_DryRun) {
-                Write-MWBA "DRYRUN: Would bring Physical Disk $diskNum Online"
-            } else {
-                Set-Disk -Number $diskNum -IsOffline $false -ErrorAction SilentlyContinue
-                Write-MWBA "Physical Disk $diskNum brought Online."
+    try {
+        if (-not (Get-Command Get-Partition -ErrorAction SilentlyContinue)) {
+            Import-Module Storage -ErrorAction SilentlyContinue
+        }
+        if (Get-Command Get-Partition -ErrorAction SilentlyContinue) {
+            $driveLetter = ($OfflineWindowsDrive.TrimEnd('\').TrimEnd(':'))
+            $part = Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -eq $driveLetter }
+            if ($part) {
+                $diskNum = $part[0].DiskNumber
+                $diskObj = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
+                if ($diskObj -and $diskObj.IsOffline) {
+                    if ($Script:MWBA_DryRun) {
+                        Write-MWBA "DRYRUN: Would bring Physical Disk $diskNum Online"
+                    } else {
+                        Set-Disk -Number $diskNum -IsOffline $false -ErrorAction SilentlyContinue
+                        Write-MWBA "Physical Disk $diskNum brought Online."
+                    }
+                }
             }
         }
+    } catch {
+        Write-MWBA "Ensure-TargetDiskOnline check warning: $($_.Exception.Message)" 'WARN'
     }
     if ($BitLockerKey -and (Get-Command manage-bde -ErrorAction SilentlyContinue)) {
         try {
@@ -1472,13 +1716,30 @@ function Disable-ELAM {
 }
 
 function Disable-Driver {
-    param([Parameter(Mandatory=$true)][string]$DriverFile, [switch]$Confirm)
+    param([Parameter(Mandatory=$true)][string]$DriverFile, [switch]$Confirm = $true)
     Write-MWBA "Disable-Driver: $DriverFile"
-    if (-not $Confirm) { Write-Warning 'Requires -Confirm'; return }
-    $full = Join-Path (Get-MWBA-OfflineWindowsPath) "System32\drivers\$DriverFile"
-    if (-not (Test-Path $full)) { Write-Warning "Driver not found: $full"; return }
+    $cleanDrv = (Split-Path $DriverFile -Leaf)
+    if (-not $cleanDrv.EndsWith('.sys', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $cleanDrv = "$cleanDrv.sys"
+    }
+    $full = Join-Path (Get-MWBA-OfflineWindowsPath) "System32\drivers\$cleanDrv"
+    if (-not (Test-Path $full)) {
+        Write-Warning "Driver not found: $full"
+        Write-MWBA "Disable-Driver: target $full does not exist on disk." 'WARN'
+        return
+    }
     $dest = "$full.disabled-by-mwba"
-    if ($Script:MWBA_DryRun) { Write-MWBA "DRYRUN: Rename $full -> $dest" } else { Rename-Item -Path $full -NewName (Split-Path $dest -Leaf) -Force; Write-MWBA "Renamed driver to $dest" }
+    if ($Script:MWBA_DryRun) {
+        Write-MWBA "DRYRUN: Rename $full -> $dest"
+    } else {
+        try {
+            Rename-Item -Path $full -NewName (Split-Path $dest -Leaf) -Force -ErrorAction Stop
+            Write-MWBA "Renamed driver to $dest"
+            Write-Host "   [OK] Quarantined driver: $cleanDrv -> $(Split-Path $dest -Leaf)" -ForegroundColor Green
+        } catch {
+            Write-MWBA "Failed to rename driver: $($_.Exception.Message)" 'FAIL'
+        }
+    }
 }
 
 function Unlock-BitLockerVolume {
@@ -1808,6 +2069,7 @@ function Start-MWBA {
         @{ Name='Restore-BCD'; Action={ Restore-BCD } },
         @{ Name='Restore-EFIBootFiles'; Action={ Restore-EFIBootFiles -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive } },
         @{ Name='Check-DriveLetterSanity'; Action={ Check-DriveLetterSanity -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive } },
+        @{ Name='Triage-BootCrash'; Action={ Triage-MWBA-BootCrash -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive } },
         @{ Name='Cleanup-PendingUpdates'; Action={ Cleanup-PendingUpdates -WindowsPath $Script:MWBA_OfflineWindowsDrive } },
         @{ Name='Repair-WinRE'; Action={ Repair-WinRE -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive } },
         @{ Name='Enable-BootLogging'; Action={ Toggle-BootLogging -Action Enable -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive } }
@@ -1868,6 +2130,33 @@ function Start-MWBA {
     }
 
     Write-MWBA 'System appears Unhealthy after Stage 1.'
+
+    # Offer Safe Mode Minimal Arming for Boot-Time Driver Crash Loops / BSODs
+    try {
+        Write-Host "`n  [+] MWBA BOOT-CRASH & SAFE MODE INTERFACER" -ForegroundColor Yellow
+        Write-Host "      If the machine is crashing during startup (BSOD / Driver Overrun / Update Loop)," -ForegroundColor DarkGray
+        Write-Host "      arming Safe Mode allows Windows to bypass all third-party filter drivers." -ForegroundColor DarkGray
+        $armSm = Read-Host "`n  Arm Safe Mode Minimal on $Script:MWBA_OfflineWindowsDrive for next boot? [y/N]"
+        if ($armSm -match '^[Yy]') {
+            $bcdStore = "$Script:MWBA_OfflineWindowsDrive\Boot\BCD"
+            $espInfo = Find-MWBA-TargetDiskESP -OfflineWindowsDrive $Script:MWBA_OfflineWindowsDrive
+            if ($espInfo -and $espInfo.DriveLetter) {
+                $candidate = "$($espInfo.DriveLetter):\EFI\Microsoft\Boot\BCD"
+                if (Test-Path $candidate) { $bcdStore = $candidate }
+            }
+            if (Test-Path $bcdStore) {
+                & bcdedit.exe /store $bcdStore /set "{default}" safeboot minimal 2>&1 | Out-Null
+                & bcdedit.exe /store $bcdStore /set "{default}" safebootalternateshell No 2>&1 | Out-Null
+                & bcdedit.exe /store $bcdStore /set "{default}" bootmenupolicy legacy 2>&1 | Out-Null
+                Write-Host "  [OK] Safe Mode Minimal armed in $bcdStore!" -ForegroundColor Green
+            } else {
+                & bcdedit.exe /set "{default}" safeboot minimal 2>&1 | Out-Null
+                & bcdedit.exe /set "{current}" safeboot minimal 2>&1 | Out-Null
+                Write-Host "  [OK] Safe Mode Minimal armed on active BCD store!" -ForegroundColor Green
+            }
+            Write-Host "  [i] Notice: Run WINTools winminidump.ps1 or Fix-BSOD-BootCrash.bat to identify crashing drivers." -ForegroundColor Cyan
+        }
+    } catch {}
 
     # Evaluate Stop-Loss Reinstall Score IMMEDIATELY before asking for Stage 2
     try {
