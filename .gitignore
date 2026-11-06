@@ -1,4 +1,4 @@
-# MWBA .gitignore - keep sensitive, bench, and private artifacts out of the repo
+﻿# MWBA .gitignore - keep sensitive, bench, and private artifacts out of the repo
 
 # Private & Maintainer Scripts
 push-to-github.ps1
@@ -78,4 +78,9 @@ desktop.ini
 * ([0-9])*
 * ([0-9]).*
 
-CHAT_HISTORY.md
+# Local Development & Workspace Exclusions
+*.local
+*.local.*
+*history*.md
+*HISTORY*.md
+.gemini/
